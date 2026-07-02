@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ChanLun BTC Risk MCP</title>
+    <link rel="stylesheet" href="/styles.css?v=20260702-chanlun-2" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>缠论交易工作台</h1>
+        <p>BTC-USDT-SWAP · OKX 公共行情 · 只读分析</p>
+      </div>
+      <div class="status-strip">
+        <span id="apiStatus">连接中</span>
+        <span id="latestPrice">--</span>
+        <span id="updatedAt">--</span>
+        <button id="refreshBtn" type="button">刷新</button>
+      </div>
+    </header>
+
+    <main class="shell">
+      <aside class="panel controls">
+        <section>
+          <h2>级别</h2>
+          <div class="timeframe-grid" id="timeframeGrid"></div>
+        </section>
+        <section>
+          <h2>参数</h2>
+          <label>
+            K线数量
+            <input id="limitInput" type="number" min="120" max="1000" step="100" value="1000" />
+          </label>
+          <label>
+            笔最小K数
+            <input id="strokeBarsInput" type="number" min="2" max="9" step="1" value="5" disabled />
+          </label>
+          <label>
+            最大建议杠杆
+            <input id="leverageInput" type="number" min="1" max="5" step="1" value="3" disabled />
+          </label>
+          <button id="analyzeBtn" class="primary" type="button">分析四级别</button>
+        </section>
+        <section class="note">
+          <h2>边界</h2>
+          <p>第一版不读取账户、不保存 API Key、不下单。所有信号默认是观察计划。</p>
+        </section>
+      </aside>
+
+      <section class="panel chart-panel">
+        <div class="chart-header">
+          <div>
+            <h2 id="chartTitle">5m 结构图</h2>
+            <p id="chartSubtitle">等待数据</p>
+          </div>
+          <div class="legend">
+            <span><i class="up"></i>上涨</span>
+            <span><i class="down"></i>下跌</span>
+            <span><i class="stroke"></i>笔</span>
+            <span><i class="center"></i>笔级中枢</span>
+            <span><i class="fractal"></i>笔端顶/底</span>
+            <span><i class="bs"></i>买1/2/3 · 卖1/2/3</span>
+          </div>
+        </div>
+        <div id="priceChart" class="price-chart"></div>
+        <div class="indicator-row">
+          <section>
+            <h3>成交量</h3>
+            <div id="volumeChart" class="indicator-chart"></div>
+          </section>
+          <section>
+            <h3>MACD</h3>
+            <div id="macdChart" class="indicator-chart"></div>
+          </section>
+        </div>
+      </section>
+
+      <aside class="panel conclusion">
+        <section>
+          <h2>多周期结论</h2>
+          <div class="summary" id="summaryBox">
+            <strong>--</strong>
+            <p>等待分析。</p>
+          </div>
+        </section>
+        <section>
+          <h2>当前级别</h2>
+          <dl id="detailBox"></dl>
+        </section>
+        <section>
+          <h2>风控计划</h2>
+          <dl id="riskBox"></dl>
+        </section>
+      </aside>
+    </main>
+
+    <footer class="panel log-panel">
+      <h2>分析记录</h2>
+      <div id="logList"></div>
+    </footer>
+
+    <script src="/vendor/lightweight-charts.standalone.production.js"></script>
+    <script src="/app.js?v=20260702-chanlun-2"></script>
+  </body>
+</html>
