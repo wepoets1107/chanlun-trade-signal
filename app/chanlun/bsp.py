@@ -4,6 +4,11 @@ from app.chanlun.models import BuySellPoint, Center, Fractal, Stroke
 from app.market.okx import OKXCandle
 
 
+# 买卖点检测参数
+MAX_BS2_RATE = 1.0  # 二买/二卖最大回撤率（回调笔range / 突破笔range），0.618为黄金分割
+MIN_DIVERGENCE_RATE = 1.0  # 一买/一卖最大力度比（离开笔range / 进入笔range），<此值视为背驰
+
+
 # ── 背离检测（保留作为辅助信号，不再作为买卖点唯一入口） ──
 
 def detect_divergence(candles: list[OKXCandle], strokes: list[Stroke], indicators: dict | None = None) -> str | None:
@@ -65,9 +70,13 @@ def classify_buy_sell_points(
     if not fractals:
         return points
 
-    # === 第一路：全量扫描所有中枢 → 收集所有买1/卖1 ===
-    all_b1 = collect_all_first_buy(fractals, strokes, centers)
-    all_s1 = collect_all_first_sell(fractals, strokes, centers)
+    # === 收集所有潜在买1/卖1，过滤连续同向点后衍生买2/买3/卖2/卖3 ===
+    all_b1 = _filter_same_side_list(
+        collect_all_first_buy(fractals, strokes, centers), "sell"
+    )
+    all_s1 = _filter_same_side_list(
+        collect_all_first_sell(fractals, strokes, centers), "buy"
+    )
 
     # 如果中枢路径没出买1，尝试趋势背离再补一个
     if not all_b1:
@@ -107,7 +116,25 @@ def classify_buy_sell_points(
             fallback = build_fallback_second_points(fractals, center, current_structure_state)
             points.extend(fallback)
 
+    points = dedupe_points(points)
     return dedupe_points(points)
+
+
+def _filter_same_side_list(points: list[BuySellPoint], opposite_side: str) -> list[BuySellPoint]:
+    """过滤连续的同类买1/卖1：两个买1之间必须有卖点，两个卖1之间必须有买点
+    
+    在派生B2/B3/S2/S3之前执行，确保衍生点不会从被过滤的基点上生成。
+    opposite_side: 两个同向点之间必须存在的反方向side
+    """
+    if len(points) < 2:
+        return points
+    sorted_pts = sorted(points, key=lambda p: p.index)
+    result: list[BuySellPoint] = [sorted_pts[0]]
+    for p in sorted_pts[1:]:
+        between = [x for x in sorted_pts if result[-1].index < x.index < p.index and x.side == opposite_side]
+        if between:
+            result.append(p)
+    return result
 
 
 # ── 买1：全量回溯所有中枢的离开笔弱于进入笔 → 收集所有买1 ──
@@ -117,26 +144,44 @@ def collect_all_first_buy(
     strokes: list[Stroke],
     centers: list[Center],
 ) -> list[BuySellPoint]:
-    """全量回溯：遍历所有下离开中枢，收集每个力度衰减的离开笔底分型"""
+    """全量回溯：收集所有买1
+    
+    两路并行：
+        1. 下离开中枢 → 离开笔弱于进入笔 → 离开笔端点（底分型）
+        2. 上离开中枢 → 中枢起点为反转底分型（下跌结束后的第一个向上中枢）
+    """
     results: list[BuySellPoint] = []
+
+    # ── 第一路：下离开中枢，离开笔弱于进入笔（标准中枢背驰） ──
     for center in centers:
         if center.exit_direction != "down":
             continue
+        _collect_b1_from_down_exit(center, fractals, strokes, results)
+
+    # ── 第二路：上离开中枢，中枢起点为反转确认（下跌→上涨的拐点） ──
+    prev_down_exit_found = False
+    for center in centers:
+        if center.exit_direction == "down":
+            prev_down_exit_found = True
+            continue
+        if center.exit_direction != "up":
+            continue
+        # 这个中枢之前有下离开中枢（即经历过下跌段），且本次向上离开
+        # → 中枢入口笔的起点就是下跌结束的底分型 = 买1
+        if not prev_down_exit_found:
+            continue
         entry_stroke = _find_stroke_by_start(center.entry_start_index, strokes)
-        if not entry_stroke:
+        if not entry_stroke or entry_stroke.direction != "up":
             continue
-        exit_stroke = _find_downward_exit_stroke(center, strokes)
-        if not exit_stroke:
-            continue
-        if _stroke_range(exit_stroke) >= _stroke_range(entry_stroke) * 0.92:
-            continue
-        bottom = fractal_at(fractals, exit_stroke.end_index, "bottom")
+        bottom = fractal_at(fractals, entry_stroke.start_index, "bottom")
         if not bottom:
             continue
         results.append(make_point(
-            bottom, "买1", "B1", "buy", 0.65,
-            "向下离开中枢笔力度弱于进入笔，中枢背驰成立，按一买观察。",
+            bottom, "买1", "B1", "buy", 0.58,
+            "下跌后形成中枢并向上离开，中枢起点按一买观察（趋势反转确认）。",
         ))
+        prev_down_exit_found = False  # 只加一次，避免连续买1
+
     return results
 
 
@@ -145,27 +190,105 @@ def collect_all_first_sell(
     strokes: list[Stroke],
     centers: list[Center],
 ) -> list[BuySellPoint]:
-    """全量回溯：遍历所有上离开中枢，收集每个力度衰减的离开笔顶分型"""
+    """全量回溯：收集所有卖1
+    
+    两路并行：
+        1. 上离开中枢 → 离开笔弱于进入笔 → 离开笔端点（顶分型）
+        2. 下离开中枢 → 中枢起点为反转顶分型（上涨结束后的第一个向下中枢）
+    """
     results: list[BuySellPoint] = []
+
+    # ── 第一路：上离开中枢，离开笔弱于进入笔（标准中枢背驰） ──
     for center in centers:
         if center.exit_direction != "up":
             continue
+        _collect_s1_from_up_exit(center, fractals, strokes, results)
+
+    # ── 第二路：下离开中枢，中枢起点为反转确认（上涨→下跌的拐点） ──
+    prev_up_exit_found = False
+    for center in centers:
+        if center.exit_direction == "up":
+            prev_up_exit_found = True
+            continue
+        if center.exit_direction != "down":
+            continue
+        if not prev_up_exit_found:
+            continue
         entry_stroke = _find_stroke_by_start(center.entry_start_index, strokes)
-        if not entry_stroke:
+        if not entry_stroke or entry_stroke.direction != "down":
             continue
-        exit_stroke = _find_upward_exit_stroke(center, strokes)
-        if not exit_stroke:
-            continue
-        if _stroke_range(exit_stroke) >= _stroke_range(entry_stroke) * 0.92:
-            continue
-        top = fractal_at(fractals, exit_stroke.end_index, "top")
+        top = fractal_at(fractals, entry_stroke.start_index, "top")
         if not top:
             continue
         results.append(make_point(
-            top, "卖1", "S1", "sell", 0.65,
-            "向上离开中枢笔力度弱于进入笔，中枢背驰成立，按一卖观察。",
+            top, "卖1", "S1", "sell", 0.58,
+            "上涨后形成中枢并向下离开，中枢起点按一卖观察（趋势反转确认）。",
         ))
+        prev_up_exit_found = False  # 只加一次，避免连续卖1
+
     return results
+
+
+def _collect_b1_from_down_exit(
+    center: Center, fractals: list[Fractal],
+    strokes: list[Stroke], results: list[BuySellPoint],
+) -> None:
+    """下离开中枢 → 离开笔弱于进入笔 → 买1"""
+    entry_stroke = _find_stroke_by_start(center.entry_start_index, strokes)
+    if not entry_stroke:
+        return
+    exit_stroke = _find_downward_exit_stroke(center, strokes)
+    if not exit_stroke:
+        return
+    bottom = fractal_at(fractals, exit_stroke.end_index, "bottom")
+    if not bottom:
+        return
+
+    entry_range = _stroke_range(entry_stroke)
+    exit_range = _stroke_range(exit_stroke)
+    if exit_range >= entry_range * MIN_DIVERGENCE_RATE:
+        return
+
+    ratio = exit_range / entry_range if entry_range > 0 else 1.0
+    if ratio < 0.85:
+        c, r = 0.70, "向下离开中枢笔力度明显弱于进入笔，中枢背驰成立，按一买观察。"
+    elif ratio < 0.95:
+        c, r = 0.65, "向下离开中枢笔力度弱于进入笔，中枢背驰成立，按一买观察。"
+    else:
+        c, r = 0.58, "向下离开中枢笔力度略弱于进入笔，中枢背驰偏弱，按一买观察。"
+
+    results.append(make_point(bottom, "买1", "B1", "buy", c, r))
+
+
+def _collect_s1_from_up_exit(
+    center: Center, fractals: list[Fractal],
+    strokes: list[Stroke], results: list[BuySellPoint],
+) -> None:
+    """上离开中枢 → 离开笔弱于进入笔 → 卖1"""
+    entry_stroke = _find_stroke_by_start(center.entry_start_index, strokes)
+    if not entry_stroke:
+        return
+    exit_stroke = _find_upward_exit_stroke(center, strokes)
+    if not exit_stroke:
+        return
+    top = fractal_at(fractals, exit_stroke.end_index, "top")
+    if not top:
+        return
+
+    entry_range = _stroke_range(entry_stroke)
+    exit_range = _stroke_range(exit_stroke)
+    if exit_range >= entry_range * MIN_DIVERGENCE_RATE:
+        return
+
+    ratio = exit_range / entry_range if entry_range > 0 else 1.0
+    if ratio < 0.85:
+        c, r = 0.70, "向上离开中枢笔力度明显弱于进入笔，中枢背驰成立，按一卖观察。"
+    elif ratio < 0.95:
+        c, r = 0.65, "向上离开中枢笔力度弱于进入笔，中枢背驰成立，按一卖观察。"
+    else:
+        c, r = 0.58, "向上离开中枢笔力度略弱于进入笔，中枢背驰偏弱，按一卖观察。"
+
+    results.append(make_point(top, "卖1", "S1", "sell", c, r))
 
 
 def _find_upward_exit_stroke(center: Center, strokes: list[Stroke]) -> Stroke | None:
@@ -229,28 +352,37 @@ def build_first_sell_by_trend(
 # ── 买2 / 卖2 ──
 
 def build_second_buy(fractals: list[Fractal], strokes: list[Stroke], first_buy: BuySellPoint) -> BuySellPoint | None:
-    """二买：一买后的回调未破一买低点"""
+    """二买：一买后的回调未破一买低点，且回撤率在合理范围内"""
     for index, stroke in enumerate(strokes):
         if stroke.start_index != first_buy.index or stroke.direction != "up":
             continue
+        # stroke 是买1后的第一笔向上（break_bi）
         pullback = next((item for item in strokes[index + 1:] if item.direction == "down"), None)
-        if pullback and pullback.end_price > first_buy.price:
-            bottom = fractal_at(fractals, pullback.end_index, "bottom")
-            if bottom:
-                return make_point(bottom, "买2", "B2", "buy", 0.64, "一买后的回调未跌破一买低点，按二买观察。")
+        if not pullback or pullback.end_price <= first_buy.price:
+            continue
+        # 回撤率过滤：回调笔力度 vs 突破笔力度
+        if _retrace_rate(pullback, stroke) > MAX_BS2_RATE:
+            continue
+        bottom = fractal_at(fractals, pullback.end_index, "bottom")
+        if bottom:
+            return make_point(bottom, "买2", "B2", "buy", 0.64, "一买后的回调未跌破一买低点，按二买观察。")
     return None
 
 
 def build_second_sell(fractals: list[Fractal], strokes: list[Stroke], first_sell: BuySellPoint) -> BuySellPoint | None:
-    """二卖：一卖后的反弹未突破一卖高点"""
+    """二卖：一卖后的反弹未突破一卖高点，且回撤率在合理范围内"""
     for index, stroke in enumerate(strokes):
         if stroke.start_index != first_sell.index or stroke.direction != "down":
             continue
+        # stroke 是卖1后的第一笔向下（break_bi）
         rebound = next((item for item in strokes[index + 1:] if item.direction == "up"), None)
-        if rebound and rebound.end_price < first_sell.price:
-            top = fractal_at(fractals, rebound.end_index, "top")
-            if top:
-                return make_point(top, "卖2", "S2", "sell", 0.64, "一卖后的反弹未突破一卖高点，按二卖观察。")
+        if not rebound or rebound.end_price >= first_sell.price:
+            continue
+        if _retrace_rate(rebound, stroke) > MAX_BS2_RATE:
+            continue
+        top = fractal_at(fractals, rebound.end_index, "top")
+        if top:
+            return make_point(top, "卖2", "S2", "sell", 0.64, "一卖后的反弹未突破一卖高点，按二卖观察。")
     return None
 
 
@@ -338,6 +470,12 @@ def _stroke_range(stroke: Stroke) -> float:
     return stroke.high - stroke.low
 
 
+def _retrace_rate(pullback: Stroke, breaker: Stroke) -> float:
+    """回撤率 = 回调笔range / 突破笔range"""
+    br = _stroke_range(breaker)
+    return _stroke_range(pullback) / br if br > 0 else 1.0
+
+
 def _find_stroke_by_start(start_index: int | None, strokes: list[Stroke]) -> Stroke | None:
     if start_index is None:
         return None
@@ -383,4 +521,27 @@ def dedupe_points(points: list[BuySellPoint]) -> list[BuySellPoint]:
     unique: dict[tuple[int, str], BuySellPoint] = {}
     for point in points:
         unique[(point.index, point.code)] = point
-    return sorted(unique.values(), key=lambda item: item.index)
+    deduped = sorted(unique.values(), key=lambda item: item.index)
+
+    # 合并同index的同侧点：B2和B3重合 → 只保留B3；S2和S3重合 → 只保留S3
+    final: list[BuySellPoint] = []
+    for point in deduped:
+        if final and final[-1].index == point.index:
+            prev = final[-1]
+            # 同侧合并：B2+B3→B3, S2+S3→S3, B1+B2→B2, S1+S2→S2
+            merge_map = {
+                ("B2", "B3"): "B3", ("B3", "B2"): "B3",
+                ("S2", "S3"): "S3", ("S3", "S2"): "S3",
+                ("B1", "B2"): "B2", ("B2", "B1"): "B2",
+                ("S1", "S2"): "S2", ("S2", "S1"): "S2",
+            }
+            key = (prev.code, point.code)
+            if key in merge_map:
+                keep_code = merge_map[key]
+                keeper = point if point.code == keep_code else prev
+                final[-1] = keeper
+            else:
+                final.append(point)
+        else:
+            final.append(point)
+    return final
